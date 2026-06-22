@@ -10,13 +10,14 @@ Output       : 3-class segmentation  (0=background  1=field  2=boundary)
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 
 # Path to AI4Boundaries data root (split subfolders: train/ val/ test/)
-DATA_ROOT = "data/ai4boundaries/france"
-
+DATA_ROOT = "data/ai4boundaries/brittany"
+OUT_ROOT="unet/outputs/efficientnet-b5_brittany" 
 # Backbone: "efficientnet-b3" (fast, ~12M params) | "efficientnet-b5" (default, ~30M params)
 BACKBONE = "efficientnet-b5"
 
 # Resume from an existing checkpoint, or None to start fresh
-RESUME_FROM = None    # e.g. "unet/outputs/efficientnet-b5/last.pt"
+# RESUME_FROM = "unet/outputs/efficientnet-b5/last.pt"
+RESUME_FROM = None
 
 # ── Per-backbone presets ──────────────────────────────────────────────────────
 _PRESETS = {
@@ -70,7 +71,7 @@ from unet.model        import build_unet
 
 def main():
     cfg     = _PRESETS[BACKBONE]
-    out_dir = ROOT / "unet" / "outputs" / BACKBONE
+    out_dir = ROOT / OUT_ROOT
     out_dir.mkdir(parents=True, exist_ok=True)
 
     device = best_device()
@@ -95,10 +96,6 @@ def main():
         pretrained=cfg["pretrained"],
     ).to(device)
 
-    if RESUME_FROM and Path(RESUME_FROM).exists():
-        model.load_state_dict(torch.load(RESUME_FROM, map_location=device))
-        print(f"Resumed from {RESUME_FROM}")
-
     # Down-weight background, up-weight boundary (rarest class)
     ce_weight = torch.tensor([0.3, 1.0, 5.0]).to(device)
     ce_loss   = nn.CrossEntropyLoss(weight=ce_weight)
@@ -106,12 +103,34 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg["epochs"])
     scaler    = grad_scaler(device)
     best_miou = 0.0
-    log_path  = out_dir / "train_log.csv"
-    log_file  = open(log_path, "w", newline="")
-    log_writer = csv.DictWriter(log_file, fieldnames=["epoch", "train_loss", "train_miou", "val_loss", "val_miou"])
-    log_writer.writeheader()
+    start_epoch = 0
 
-    for epoch in range(cfg["epochs"]):
+    if RESUME_FROM and Path(RESUME_FROM).exists():
+        ckpt = torch.load(RESUME_FROM, map_location=device)
+        if isinstance(ckpt, dict) and "model" in ckpt:
+            # Full checkpoint — restore all training state
+            model.load_state_dict(ckpt["model"])
+            optimizer.load_state_dict(ckpt["optimizer"])
+            scheduler.load_state_dict(ckpt["scheduler"])
+            if ckpt.get("scaler") and hasattr(scaler, "load_state_dict"):
+                scaler.load_state_dict(ckpt["scaler"])
+            best_miou   = ckpt.get("best_miou", 0.0)
+            start_epoch = ckpt.get("epoch", 0)
+            print(f"Resumed from {RESUME_FROM}  (epoch {start_epoch}, best_miou={best_miou:.4f})")
+        else:
+            # Legacy weights-only checkpoint
+            model.load_state_dict(ckpt)
+            print(f"Loaded weights from {RESUME_FROM}  (optimizer/scheduler not restored)")
+
+    log_path = out_dir / "train_log.csv"
+    # Append to existing log when resuming, otherwise start fresh
+    log_mode = "a" if start_epoch > 0 else "w"
+    log_file  = open(log_path, log_mode, newline="")
+    log_writer = csv.DictWriter(log_file, fieldnames=["epoch", "train_loss", "train_miou", "val_loss", "val_miou"])
+    if log_mode == "w":
+        log_writer.writeheader()
+
+    for epoch in range(start_epoch, cfg["epochs"]):
         # ── Train ─────────────────────────────────────────────────────────────
         model.train()
         train_loss = train_iou = 0.0
@@ -156,7 +175,7 @@ def main():
         val_iou  /= len(val_ds)
 
         print(
-            f"Epoch {epoch+1:03d} | "
+            f"Epoch {epoch+1:03d}/{cfg['epochs']} | "
             f"train_loss={train_loss:.4f}  train_mIoU={train_iou:.4f} | "
             f"val_loss={val_loss:.4f}  val_mIoU={val_iou:.4f}"
         )
@@ -166,10 +185,19 @@ def main():
                               "val_miou": round(val_iou, 6)})
         log_file.flush()
 
-        torch.save(model.state_dict(), out_dir / "last.pt")
+        full_ckpt = {
+            "epoch":     epoch + 1,
+            "model":     model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "scaler":    scaler.state_dict() if hasattr(scaler, "state_dict") else None,
+            "best_miou": best_miou,
+        }
+        torch.save(full_ckpt, out_dir / "last.pt")
         if val_iou > best_miou:
             best_miou = val_iou
-            torch.save(model.state_dict(), out_dir / "best.pt")
+            full_ckpt["best_miou"] = best_miou
+            torch.save(full_ckpt, out_dir / "best.pt")
             print(f"  New best saved  (val_mIoU={best_miou:.4f})")
 
     log_file.close()

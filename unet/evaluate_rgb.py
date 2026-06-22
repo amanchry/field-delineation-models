@@ -15,8 +15,8 @@ SPLIT       = "test"
 BACKBONE    = "efficientnet-b5"
 IN_CHANNELS = 6        # 3 RGB bands × 2 time windows
 NUM_CLASSES = 3
-CHECKPOINT  = "unet/outputs/efficientnet-b5_rgb/best.pt"
 OUT_DIR     = "unet/outputs/efficientnet-b5_rgb"
+CHECKPOINT  = "unet/outputs/efficientnet-b5_rgb/best.pt"
 N_VISUAL    = 4
 
 # ─────────────────────────────────────────────────────────────────────────────

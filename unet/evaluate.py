@@ -12,8 +12,8 @@ SPLIT       = "test"
 BACKBONE    = "efficientnet-b5"
 IN_CHANNELS = 8
 NUM_CLASSES = 3
-CHECKPOINT  = "unet/outputs/efficientnet-b5_v1/best.pt"
-OUT_DIR = "unet/outputs/efficientnet-b5_v1"
+CHECKPOINT  = "unet/outputs/efficientnet-b5_brittany_rgb/best.pt"
+OUT_DIR = "unet/outputs/efficientnet-b5_brittany_rgb"
 N_VISUAL    = 4
 
 

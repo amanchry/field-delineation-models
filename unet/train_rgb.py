@@ -18,10 +18,10 @@ DATA_ROOT = "data/ai4boundaries/brittany"
 BACKBONE = "efficientnet-b5"
 
 # Resume from an existing checkpoint, or None to start fresh
-RESUME_FROM = None    # e.g. "unet/outputs/efficientnet-b5_rgb/last.pt"
+# RESUME_FROM = "unet/outputs/efficientnet-b5_rgb/last.pt"
+RESUME_FROM = None
 
-OUT_ROOT=f"unet/outputs/{BACKBONE}_rgb"
-
+OUT_ROOT="unet/outputs/efficientnet-b5_brittany_rgb" 
 
 # ── Per-backbone presets ──────────────────────────────────────────────────────
 _PRESETS = {
