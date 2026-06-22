@@ -35,10 +35,10 @@ from sam2.model     import build_sam2, load_sam2_mask_generator
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 
-VARIANT      = "base_plus"
-DECODER_PATH = "sam2/outputs/base_plus_v2/decoder_final.pt"   # None = base SAM2
+VARIANT      = "small"
+DECODER_PATH = "sam2/outputs/small/decoder_final.pt"   # None = base SAM2
 DATA_ROOT    = "data/ai4boundaries/brittany"
-OUT_ROOT    = "sam2/outputs/base_plus_v2"
+OUT_ROOT    = "sam2/outputs/small"
 SPLIT        = "test"
 CONF_THRESH  = 0.5
 N_VISUAL     = 4

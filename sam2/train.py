@@ -14,29 +14,29 @@ Edit CONFIG then run:
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 
-VARIANT    = "base_plus"   # tiny | small | base_plus | large
-DATA_ROOT  = "data/ai4boundaries/brittany"
+VARIANT    = "small"   # tiny | small | base_plus | large
+DATA_ROOT  = "data/ai4boundaries/france"
 RESUME_DECODER = None      # e.g. "sam2/outputs/base_plus/decoder_epoch05.pt"
 
 # ── Per-variant presets ───────────────────────────────────────────────────────
 _PRESETS = {
     "tiny": dict(
-        channels=3, epochs=20, batch_size=16, lr=1e-4, weight_decay=1e-4,
+        channels=3, epochs=50, batch_size=16, lr=1e-4, weight_decay=1e-4,
         accumulation_steps=1, num_workers=4, nsel=3, max_image_size=1024, warmup_epochs=2,
         output_dir="sam2/outputs/tiny",
     ),
     "small": dict(
-        channels=3, epochs=20, batch_size=8, lr=1e-4, weight_decay=1e-4,
+        channels=3, epochs=50, batch_size=8, lr=1e-4, weight_decay=1e-4,
         accumulation_steps=2, num_workers=4, nsel=3, max_image_size=1024, warmup_epochs=2,
         output_dir="sam2/outputs/small",
     ),
     "base_plus": dict(
-        channels=3, epochs=20, batch_size=4, lr=5e-5, weight_decay=1e-4,
+        channels=3, epochs=50, batch_size=4, lr=5e-5, weight_decay=1e-4,
         accumulation_steps=4, num_workers=4, nsel=3, max_image_size=1024, warmup_epochs=2,
         output_dir="sam2/outputs/base_plus",
     ),
     "large": dict(
-        channels=3, epochs=20, batch_size=2, lr=3e-5, weight_decay=1e-4,
+        channels=3, epochs=50, batch_size=2, lr=3e-5, weight_decay=1e-4,
         accumulation_steps=8, num_workers=4, nsel=3, max_image_size=1024, warmup_epochs=2,
         output_dir="sam2/outputs/large",
     ),

@@ -34,7 +34,7 @@ from sam2.model     import build_sam2, load_sam2_mask_generator
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 
-VARIANT     = "base_plus"
+VARIANT     = "small"
 DATA_ROOT   = "data/ai4boundaries/brittany"
 OUT_ROOT   = "sam2/outputs/brittany"
 SPLIT       = "test"
