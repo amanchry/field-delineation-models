@@ -1,0 +1,488 @@
+================================================================================
+  FIELD BOUNDARY DELINEATION MODELS — PROJECT OVERVIEW
+================================================================================
+
+--------------------------------------------------------------------------------
+1. WHAT THIS PROJECT IS
+--------------------------------------------------------------------------------
+
+This project implements and benchmarks multiple deep learning models for
+automated agricultural field boundary detection from satellite and aerial
+imagery. The goal is to automatically delineate (draw boundaries around)
+individual farm fields in remote sensing images — a task critical for
+precision agriculture, land monitoring, and subsidy verification.
+
+Five different model families are implemented:
+  1. UNet (trained from scratch on this dataset)
+  2. SAM1 — Segment Anything Model v1 (fine-tuned decoder)
+  3. SAM2 — Segment Anything Model v2 (fine-tuned decoder, temporal)
+  4. DelineateAnything — YOLO-based, zero-shot (no training required)
+  5. UNet Pretrained — FTW (Fields of the World) baseline models
+
+All models are evaluated on the same AI4Boundaries benchmark dataset, enabling
+direct comparison of approaches ranging from scratch training to zero-shot.
+
+
+--------------------------------------------------------------------------------
+2. DATASET — AI4Boundaries
+--------------------------------------------------------------------------------
+
+Paper:   https://essd.copernicus.org/articles/15/317/2023/
+GitHub:  https://github.com/waldnerf/ai4boundaries
+Data:    https://data.jrc.ec.europa.eu/dataset/0e79ce5d-e4c8-4721-8773-59a4acf2c9c9
+
+--- Coverage ---
+  - 7 European countries: Austria, Catalonia (Spain), France, Luxembourg,
+    Netherlands, Slovenia, Sweden
+  - ~7,831 tiles of 4×4 km, covering ~47,105 km²
+  - ~2.5 million agricultural parcels
+  - Ground truth from official 2019 GSAA (Geospatial Aid Application) records
+
+--- Data Splits ---
+  Train : 70% (~5,319 tiles)
+  Val   : 15% (~1,140 tiles)
+  Test  : 15% (~1,139 tiles)
+
+  Stored locally under:
+    data/ai4boundaries/france/    (full France subset)
+    data/ai4boundaries/brittany/  (smaller Brittany subset, used for fast runs)
+
+--- Modality 1: Sentinel-2 Satellite Imagery ---
+  Resolution  : 10 m/pixel
+  Chip size   : 256×256 pixels = 2.56 km × 2.56 km
+  Bands       : 5 (Red, Green, Blue, NIR, NDVI)
+  Temporal    : 6 monthly cloud-free composites — March through August 2019
+  Format      : NetCDF (.nc)
+  Naming      : {COUNTRY}_{sampleID}_S2_10m_256.nc
+  Values      : Level-2A surface reflectance, scaled by 10,000
+
+--- Modality 2: Orthophoto Aerial Photography ---
+  Resolution  : 1 m/pixel (10× sharper than Sentinel-2)
+  Chip size   : 512×512 pixels = 512 m × 512 m
+  Bands       : 3 (RGB only; NIR dropped for cross-country consistency)
+  Temporal    : Single date in 2019 (no time series)
+  Format      : GeoTIFF (.tif)
+  Naming      : {COUNTRY}_{sampleID}_ortho_1m_512.tif
+  Note        : Not available for 233 Swedish tiles due to licensing
+
+--- Label Masks (4-band GeoTIFF) ---
+  Band 1 — Extent   : Binary (1 = field pixel, 0 = background)
+  Band 2 — Boundary : Binary (1 = boundary pixel, dilated 1 px)
+  Band 3 — Distance : Normalized distance transform (0 at edge → 1 at center)
+  Band 4 — Field ID : Integer ID, one unique value per field instance per chip
+
+  Naming: {COUNTRY}_{sampleID}_S2label_10m_256.tif
+
+
+--------------------------------------------------------------------------------
+3. SHARED UTILITIES (shared/)
+--------------------------------------------------------------------------------
+
+--- Dataset Classes (shared/dataset.py) ---
+
+  AI4BoundariesDataset
+    Used by: UNet
+    Input  : 8-band Sentinel-2 (4 bands from March + 4 bands from August)
+    Output : image [8, 256, 256], mask [256, 256] with classes 0/1/2
+    Mask   : 0 = background, 1 = field interior, 2 = boundary
+
+  AI4BoundariesSAM1Dataset
+    Used by: SAM1, DelineateAnything
+    Input  : August (t=5) composite only, RGB (3 channels by default)
+    Output : image [3, 256, 256], mask [256, 256] with instance IDs (band 4)
+    Mask   : 0 = background, integers = individual field instance IDs
+
+  AI4BoundariesSAM2Dataset
+    Used by: SAM2
+    Input  : March (t=0) + August (t=5) as a 2-frame temporal sequence
+    Output : window_a [3,256,256] (March), window_b [3,256,256] (August),
+             mask [256,256] with instance IDs
+    Note   : March = context frame; August = prediction frame
+
+--- Losses (shared/losses.py) ---
+  dice_loss()    — Binary soft Dice loss
+  focal_loss()   — Binary focal loss (gamma=2, alpha=0.5)
+  sam2_loss()    — Composite: focal + dice + IoU regression on 3 mask heads;
+                   picks best-of-3 mask per prediction
+
+--- Metrics (shared/metrics.py) ---
+  pixel_iou()       — Per-class pixel-level IoU (Intersection over Union)
+  object_metrics()  — Instance-level matching via connected components;
+                      matches pred instances to GT at IoU >= 0.5;
+                      returns precision, recall, F1
+
+--- Augmentation (shared/transforms.py) ---
+  UNetTransform   — Random flips + 90° rotations
+  Sam1Transform   — Pads to 1024×1024, samples random instances, extracts
+                    point prompts (centroid of each instance)
+  Sam2Transform   — Same as Sam1 but for both temporal windows
+
+--- Device (shared/device.py) ---
+  best_device()  — Auto-selects: CUDA > MPS (Apple Silicon) > CPU
+  amp_context()  — Auto mixed precision context per device
+  grad_scaler()  — GradScaler, enabled only on CUDA
+
+
+--------------------------------------------------------------------------------
+4. MODEL 1 — UNet (unet/)
+--------------------------------------------------------------------------------
+
+Type        : Semantic segmentation, trained from scratch on this dataset
+Architecture: UNet with EfficientNet encoder (segmentation-models-pytorch)
+Input       : 8-band Sentinel-2 (4 bands × 2 time windows: March + August)
+Output      : 3-class segmentation — background / field interior / boundary
+
+Variants:
+  efficientnet-b3 — ~12M params, faster
+  efficientnet-b5 — ~30M params, default (better accuracy)
+
+Training setup:
+  Epochs      : 100
+  Batch size  : 8
+  LR          : 1e-4
+  Weight decay: 1e-4
+  Loss        : Cross-Entropy + Dice, both weighted to emphasize boundary class
+                CE weights  = [0.3, 1.0, 5.0]   (background / field / boundary)
+                Dice weights= [0.2, 0.4, 1.4]
+  Optimizer   : AdamW
+  Scheduler   : CosineAnnealingLR
+  AMP         : Enabled on CUDA
+
+Outputs:
+  unet/outputs/efficientnet-b5/last.pt   — latest checkpoint
+  unet/outputs/efficientnet-b5/best.pt   — best validation mIoU checkpoint
+
+Key characteristics:
+  - Only model that uses the full 8-band multi-temporal input
+  - Only model trained for 3-class output (background / field / boundary)
+  - Backbone weights can be initialized from ImageNet pretrained
+
+
+--------------------------------------------------------------------------------
+5. MODEL 2 — SAM1 Fine-Tuning (sam1/)
+--------------------------------------------------------------------------------
+
+Type        : Instance segmentation, fine-tuned decoder on this dataset
+Architecture: Segment Anything Model v1 (Meta AI)
+Source      : https://github.com/facebookresearch/segment-anything
+Input       : Single RGB frame (August Sentinel-2 composite), 256×256
+Output      : Instance masks via SamAutomaticMaskGenerator
+
+Variants:
+  vit_b — ViT-Base encoder (~1.2B enc), smallest, default
+  vit_l — ViT-Large encoder (~0.6B enc), larger
+  vit_h — ViT-Huge encoder, largest
+
+What gets trained:
+  - Image encoder   : FROZEN (not updated)
+  - Prompt encoder  : FROZEN (not updated)
+  - Mask decoder    : ~4M trainable params — this is what is fine-tuned
+
+Training setup:
+  Epochs      : 20
+  Batch size  : 16
+  LR          : 1e-4
+  Weight decay: 1e-4
+  Warmup      : 2 epochs linear
+  Loss        : sam2_loss (focal + dice + IoU score regression, best-of-3)
+  Optimizer   : AdamW
+  Scheduler   : Linear warmup → CosineAnnealingLR
+  Prompts     : Point prompts (centroid of each sampled field instance)
+
+Outputs:
+  sam1/outputs/vit_b/decoder_epoch{N}.pt  — per-epoch checkpoints
+  sam1/outputs/vit_b/decoder_final.pt     — final weights
+
+Weights download:
+  vit_b: https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth
+  vit_l: https://dl.fbaipublicfiles.com/segment_anything/sam_vit_l_0b3195.pth
+  vit_h: https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth
+
+Key characteristics:
+  - No temporal information — single August frame only
+  - Fine-tuning only updates the decoder (cheap and fast)
+  - Zero-shot baseline also available (evaluate_frozen.py) for comparison
+  - SAM1 requires float32; MPS device falls back to CPU for some ops
+
+
+--------------------------------------------------------------------------------
+6. MODEL 3 — SAM2 Fine-Tuning (sam2/)
+--------------------------------------------------------------------------------
+
+Type        : Instance segmentation with temporal modeling, fine-tuned decoder
+Architecture: Segment Anything Model 2 (Meta AI, 2024)
+Source      : https://github.com/facebookresearch/segment-anything-2
+Input       : TWO frames — March (context) + August (prediction) Sentinel-2 RGB
+Output      : Instance masks via SAM2AutomaticMaskGenerator
+
+Variants (Hiera backbone):
+  tiny       — smallest, fastest
+  small
+  base_plus  — default
+  large      — largest, most accurate
+
+What gets trained:
+  - Image encoder   : FROZEN
+  - Prompt encoder  : FROZEN
+  - Memory encoder  : FROZEN (handles temporal frame encoding)
+  - Mask decoder    : ~4M trainable params — fine-tuned only
+
+How temporal modeling works:
+  - March frame (window_a) is encoded first with no gradient — acts as memory
+  - SAM2's memory mechanism then conditions the August prediction on it
+  - Gradients only flow through the August prediction path
+
+Training setup:
+  Epochs       : 20
+  Batch size   : 4 (gradient accumulation × 4 = effective batch 16)
+  LR           : 5e-5
+  Weight decay : 1e-4
+  Warmup       : 2 epochs
+  Loss         : sam2_loss
+  Prompt mix   : 33% point only / 33% mask only / 33% point + mask
+  Optimizer    : AdamW
+  Scheduler    : Linear warmup → CosineAnnealingLR
+
+Weights download:
+  Via HuggingFace: facebook/sam2.1-hiera-{tiny|small|base-plus|large}
+
+Key characteristics:
+  - Only model to exploit temporal information through SAM2's video mechanism
+  - March frame provides seasonal context for better August field detection
+  - More sophisticated than SAM1 but slower
+  - Zero-shot baseline also available (evaluate_frozen.py)
+
+
+--------------------------------------------------------------------------------
+7. MODEL 4 — DelineateAnything (delineateanything/)
+--------------------------------------------------------------------------------
+
+Type        : Instance segmentation, fully pretrained — NO training needed
+Architecture: YOLO11x-seg (Ultralytics)
+Source      : https://github.com/MykolaL/DelineateAnything
+Input       : Single RGB frame (August Sentinel-2), 256×256
+Output      : YOLO instance segmentation Results (polygons + binary masks)
+
+Variants:
+  DelineateAnything-S  — YOLO11n backbone (faster, smaller)
+  DelineateAnything    — YOLO11x backbone (more accurate, default)
+
+Pre-training:
+  - Trained on FBIS-22M: Field Boundary Instance Segmentation dataset of 22M samples
+  - Covers diverse geographies worldwide
+  - Zero-shot transfer — works out-of-the-box on new regions
+
+Evaluation configuration:
+  Confidence threshold : 0.05
+  IoU threshold        : 0.3
+  Max detections       : 300 per tile
+
+Weights download:
+  DelineateAnything-S : https://huggingface.co/MykolaL/DelineateAnything/resolve/main/DelineateAnything-S.pt
+  DelineateAnything   : https://huggingface.co/MykolaL/DelineateAnything/resolve/main/DelineateAnything.pt
+
+Key characteristics:
+  - Zero-shot: no fine-tuning required
+  - Very fast inference (YOLO architecture)
+  - Returns instance-level field polygons directly
+  - 203 layers, 62M parameters, 295.9 GFLOPs
+  - MPS (Apple Silicon) may fall back to CPU for some YOLO ops
+
+
+--------------------------------------------------------------------------------
+8. MODEL 5 — UNet Pretrained / FTW Baselines (unet_pretrained/)
+--------------------------------------------------------------------------------
+
+Type        : Pre-trained baselines from the Fields of the World (FTW) project
+Architecture: UNet + EfficientNet (B3 / B5 / B7), UPerNet, DeepLabV3+
+Source      : https://github.com/fieldsoftheworld/ftw-baselines
+Input       : Sentinel-2 imagery (format depends on model variant)
+Output      : Semantic segmentation (2-class or 3-class)
+
+Model registry (unet_pretrained/model_registry.py) includes:
+
+  FTW v1 (legacy):
+    FTW_v1_2_Class_CCBY  — 2-class, CC-BY licensed training data only
+    FTW_v1_2_Class_FULL  — 2-class, mixed open licenses
+    FTW_v1_3_Class_CCBY  — 3-class (background/field/boundary), CC-BY only
+    FTW_v1_3_Class_FULL  — 3-class, mixed licenses
+
+  FTW v2 (legacy):
+    FTW_v2_3_Class_FULL_singleWindow   — single time window input
+    FTW_v2_3_Class_FULL_multiWindow    — dual time windows (recommended)
+
+  FTW v3 (current):
+    FTW_PRUE_EFNET_B3   — EfficientNet-B3 backbone (fastest)
+    FTW_PRUE_EFNET_B5   — EfficientNet-B5 backbone (default, recommended)
+    FTW_PRUE_EFNET_B7   — EfficientNet-B7 backbone (most accurate)
+    (+ CC-BY variants of each: B3_CCBY, B5_CCBY, B7_CCBY)
+
+  Also in registry: DelineateAnything-S, DelineateAnything (YOLO-based)
+
+Weights download:
+  GitHub Releases: https://github.com/fieldsoftheworld/ftw-baselines/releases
+  HuggingFace   : https://hf.co/torchgeo/delineate-anything/
+
+Checkpoint format:
+  PyTorch Lightning format; state dict keys prefixed with "model."
+  Hyperparameters stored in checkpoint
+
+Key characteristics:
+  - Zero-shot evaluation — no fine-tuning on AI4Boundaries
+  - Useful as a strong baseline (FTW trained on global fields data)
+  - Evaluate all registry models without any training
+
+
+--------------------------------------------------------------------------------
+9. EVALUATION METRICS
+--------------------------------------------------------------------------------
+
+All models are evaluated using the same two metrics:
+
+  Pixel IoU (Field IoU)
+    Intersection over Union at the pixel level for the "field" class.
+    Measures how well the model recovers total field area.
+    Computed via pixel_iou() in shared/metrics.py.
+
+  Object-Level Precision / Recall / F1
+    Instance-level matching: predicted and GT field instances are extracted
+    via connected components (scipy.ndimage.label).
+    A predicted instance is a True Positive if it overlaps a GT instance
+    at IoU >= 0.5. Otherwise it is a False Positive.
+    GT instances with no matching prediction are False Negatives.
+    Computed via object_metrics() in shared/metrics.py.
+
+
+--------------------------------------------------------------------------------
+10. OUTPUT STRUCTURE
+--------------------------------------------------------------------------------
+
+Each model writes results to its own outputs/ folder:
+
+  <model_folder>/outputs/<variant>/
+    results_test.csv         — per-sample CSV: iou_field, precision, recall, F1
+    metrics_summary.png      — bar chart: mean IoU / Precision / Recall / F1
+    iou_histogram.png        — distribution of per-sample IoU scores
+    metrics_boxplot.png      — box plots for all four metrics
+    pr_scatter.png           — Precision vs Recall scatter, coloured by IoU
+    confusion_matrix.png     — pixel-level binary confusion matrix
+    visual_grid.png          — 4-row grid: RGB | GT (green overlay) |
+                               Prediction (orange overlay) | Error Map
+
+
+--------------------------------------------------------------------------------
+11. MODEL COMPARISON SUMMARY
+--------------------------------------------------------------------------------
+
+                  UNet          SAM1          SAM2          DelineateAnything
+  Architecture  UNet+EffNet   ViT+Decoder   Hiera+Decoder  YOLO11x
+  Input bands   8 (multitemp) 3 (RGB only)  3+3 (temporal) 3 (RGB only)
+  Temporal      Yes (stacked) No            Yes (video)    No
+  Training      Full model    Decoder only  Decoder only   Zero-shot
+  Output type   Semantic seg  Instance seg  Instance seg   Instance seg
+  Trainable     ~30M params   ~4M params    ~4M params     (none)
+  Backbone      Trainable     Frozen        Frozen         Frozen
+  Speed         Moderate      Fast          Moderate       Very fast
+  Zero-shot     No            No            Limited        Yes
+
+
+--------------------------------------------------------------------------------
+12. ENVIRONMENT SETUP
+--------------------------------------------------------------------------------
+
+  conda env create -f environment.yml
+  conda activate fielddl
+
+Key dependencies:
+  torch >= 2.2               (deep learning)
+  segmentation-models-pytorch (UNet architectures)
+  sam2 >= 1.0                (SAM1 and SAM2)
+  ultralytics == 8.3.148     (YOLO / DelineateAnything)
+  rasterio >= 1.3            (GeoTIFF reading)
+  xarray >= 2023.1           (NetCDF reading)
+  geopandas >= 1.0           (vector data)
+  huggingface_hub >= 0.20    (weight downloads)
+  Python 3.11
+
+
+--------------------------------------------------------------------------------
+13. QUICK START — RUNNING EACH MODEL
+--------------------------------------------------------------------------------
+
+  # DelineateAnything (zero-shot, fastest)
+  python3 delineateanything/evaluate.py
+
+  # FTW pretrained baselines (zero-shot)
+  python3 unet_pretrained/evaluate.py
+
+  # UNet (train first, then evaluate)
+  python3 unet/train.py
+  python3 unet/evaluate.py
+
+  # SAM1 (fine-tune decoder, then evaluate)
+  python3 sam1/train.py
+  python3 sam1/evaluate.py
+
+  # SAM2 (fine-tune decoder, then evaluate)
+  python3 sam2/train.py
+  python3 sam2/evaluate.py
+
+  # Visualize results for any model
+  python3 delineateanything/visualize.py
+
+
+================================================================================
+
+
+
+
+
+Field IoU — Of all pixels that are field (in GT or prediction), what fraction overlap correctly. Penalises both missing fields and predicting too much.
+
+Precision — Of all fields the model detected, what fraction actually exist in GT. High precision = few false alarms.
+
+Recall — Of all real fields in GT, what fraction did the model find. High recall = few missed fields.
+
+F1 — Harmonic mean of Precision and Recall. Single number balancing both — high only when both are high.
+
+Simple example: 10 real fields, model predicts 12.
+
+8 predictions match GT → TP=8, FP=4 (extra), FN=2 (missed)
+Precision = 8/12 = 0.67 (⅓ of predictions wrong)
+Recall = 8/10 = 0.80 (found 8 of 10 real fields)
+F1 = 2×(0.67×0.80)/(0.67+0.80) = 0.73
+Field IoU = 8/(8+4+2) = 0.57 (pixel overlap / total field pixels ever seen)
+
+
+================================================================================
+
+
+
+
+
+metrics_summary.png — Bar chart
+Mean score for each metric (Field IoU, Precision, Recall, F1) across all test samples. Error bars show ±1 std. Quick overall performance snapshot. Value printed on each bar.
+
+iou_histogram.png — IoU distribution
+How per-sample Field IoU is distributed across the test set. Red dashed = mean, orange dashed = median. Shows whether the model performs consistently or has a lot of variance — e.g. a bimodal histogram means the model either works well or fails completely with few middle cases.
+
+metrics_boxplot.png — Box plots
+Same four metrics shown as box plots. Shows median, interquartile range (IQR), whiskers, and outliers. Better than the bar chart for understanding spread — e.g. a high mean IoU with a wide box means inconsistent results.
+
+pr_scatter.png — Precision vs Recall scatter
+Each dot = one test tile. X = Recall (how many GT fields were found), Y = Precision (how many predictions were correct). Colour = IoU (red=low, green=high). Dots clustered top-right = good. Shows the precision-recall trade-off and whether the model over-segments (high recall, low precision) or under-segments (high precision, low recall).
+
+confusion_matrix.png — Pixel-level confusion matrix
+Accumulated over all test samples. Shows % of total pixels falling into each cell: TN (correctly predicted background), TP (correctly predicted field), FP (predicted field but actually background), FN (missed field). Tells you where pixels are being confused — e.g. high FP means the model predicts too much field area.
+
+visual_grid.png — Side-by-side tile comparison
+N tiles sampled worst→best by IoU (so you see the full quality spectrum). 4 columns per row:
+
+
+RGB (August)	The actual Sentinel-2 satellite image, contrast-stretched so fields are visible
+Ground Truth	Same RGB but field pixels overlaid in green — what the correct answer looks like
+Prediction	Same RGB but predicted field pixels overlaid in orange — what the model output
+Error Map	Black background with coloured pixels: green=TP (correctly found field), red=FP (predicted field but it's background), blue=FN (missed real field)
+
+
+

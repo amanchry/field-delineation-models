@@ -1,0 +1,511 @@
+================================================================================
+  FIELD BOUNDARY DELINEATION — PRESENTATION OUTLINE
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+SLIDE 1 — TITLE
+────────────────────────────────────────────────────────────────────────────────
+
+  Automated Agricultural Field Boundary Delineation
+  Using Deep Learning & Satellite Imagery
+
+  Benchmarking 5 Model Families on the AI4Boundaries Dataset
+
+
+────────────────────────────────────────────────────────────────────────────────
+SLIDE 2 — PROBLEM STATEMENT
+────────────────────────────────────────────────────────────────────────────────
+
+  WHAT IS FIELD BOUNDARY DELINEATION?
+  → Automatically drawing boundaries around individual farm fields
+    from satellite or aerial images
+
+  WHY DOES IT MATTER?
+  → Precision agriculture — per-field crop monitoring
+  → Land use mapping & change detection
+  → Agricultural subsidy verification (EU GSAA compliance)
+  → Reduces manual digitization (currently expensive & slow)
+
+  THE CHALLENGE
+  → Field sizes vary enormously (small plots to large farms)
+  → Boundaries can be subtle (similar spectral response)
+  → Cloud cover, seasonal variation, shadow
+  → Must generalize across countries and crop types
+
+
+────────────────────────────────────────────────────────────────────────────────
+SLIDE 3 — DATASET: AI4Boundaries
+────────────────────────────────────────────────────────────────────────────────
+
+  Source: European Joint Research Centre (JRC)
+  Paper : https://essd.copernicus.org/articles/15/317/2023/
+
+  COVERAGE
+  → 7 European countries: Austria, France, Spain (Catalonia),
+    Luxembourg, Netherlands, Slovenia, Sweden
+  → 7,831 tiles of 4 × 4 km
+  → ~2.5 million agricultural parcels
+  → ~47,105 km² total area
+
+  GROUND TRUTH
+  → Official 2019 GSAA (farm subsidy application) records
+  → Split: 70% Train / 15% Val / 15% Test
+
+
+────────────────────────────────────────────────────────────────────────────────
+SLIDE 4 — INPUT DATA
+────────────────────────────────────────────────────────────────────────────────
+
+  SATELLITE: SENTINEL-2
+  → Resolution  : 10 m/pixel
+  → Chip size   : 256 × 256 pixels (2.56 × 2.56 km)
+  → Bands       : Red, Green, Blue, NIR, NDVI
+  → Time series : 6 monthly composites (March – August 2019)
+  → Cloud-free Level-2A surface reflectance
+
+  AERIAL: ORTHOPHOTO
+  → Resolution  : 1 m/pixel (10× sharper than Sentinel-2)
+  → Chip size   : 512 × 512 pixels
+  → Bands       : RGB only
+  → Single date in 2019
+
+
+────────────────────────────────────────────────────────────────────────────────
+SLIDE 5 — LABELS (GROUND TRUTH MASKS)
+────────────────────────────────────────────────────────────────────────────────
+
+  4-band GeoTIFF per tile:
+
+  Band 1 — Field Extent   : Binary (1 = field pixel)
+  Band 2 — Boundary       : Binary (1 = boundary, dilated 1 px)
+  Band 3 — Distance Map   : 0 at boundary → 1 at field center
+  Band 4 — Instance ID    : Unique integer per field polygon
+
+  → Supports semantic segmentation (bands 1–2)
+  → Supports instance segmentation (band 4)
+  → Supports distance regression (band 3)
+
+
+────────────────────────────────────────────────────────────────────────────────
+SLIDE 6 — MODELS OVERVIEW
+────────────────────────────────────────────────────────────────────────────────
+
+  5 model families benchmarked on the same test set:
+
+  ┌─────────────────────┬──────────────────────────────┬────────────┐
+  Model               Approach                     Training  
+  ├─────────────────────┼──────────────────────────────┼────────────┤
+  UNet                Semantic segmentation        Full      
+  SAM1                Instance seg (ViT decoder)   Decoder   
+  SAM2 (frozen)       Instance seg + temporal      Zero-shot
+  SAM2 (fine-tuned)   Instance seg + temporal      Decoder
+  DelineateAnything   YOLO instance segmentation   Zero-shot 
+  FTW Pretrained      UNet global baseline         Zero-shot 
+  └─────────────────────┴──────────────────────────────┴────────────┘
+
+
+────────────────────────────────────────────────────────────────────────────────
+SLIDE 7 — MODEL 1: UNet
+────────────────────────────────────────────────────────────────────────────────
+
+  Architecture : UNet + EfficientNet-B5 encoder
+  Library      : segmentation-models-pytorch
+
+  INPUT  → 8 bands (March + August, 4 bands each: R, G, B, NIR)
+  OUTPUT → 3-class map: background / field interior / boundary
+
+  ARCHITECTURE DETAILS
+  → Encoder  : EfficientNet-B5 (compound-scaled CNN, ImageNet pretrained)
+               Variants available: B3 (~12M params) | B5 (~30M params, default)
+  → Decoder  : UNet-style skip connections — upsamples encoder features
+               back to original 256×256 resolution
+  → Head     : 1×1 conv → 3-class softmax output
+
+  TRAINING PARAMETERS
+  ┌─────────────────────┬────────────────────────────────────────────┐
+  Epochs              100                                       
+  Batch size          8                                         
+  Learning rate       1e-4                                      
+  Weight decay        1e-4                                      
+  Optimizer           AdamW                                     
+  LR scheduler        CosineAnnealingLR (decays to 0 by ep 100)
+  AMP (mixed prec.)   Enabled on CUDA                          
+  Loss function       Cross-Entropy + Dice (combined)          
+  CE class weights    [0.3, 1.0, 5.0] — background/field/bound 
+  Dice class weights  [0.2, 0.4, 1.4] — emphasizes boundary    
+  Trainable params    ~30M (full encoder + decoder)             
+  └─────────────────────┴────────────────────────────────────────────┘
+
+  WHY THESE CHOICES?
+  → High boundary loss weight (5×): boundary pixels are sparse (~5% of mask)
+    so without upweighting, the model ignores them
+  → 8-band multi-temporal input: stacking March + August captures crop
+    phenology changes that make boundaries easier to detect
+  → CosineAnnealingLR: smooth LR decay avoids sharp loss spikes late in training
+
+
+────────────────────────────────────────────────────────────────────────────────
+SLIDE 8 — MODEL 2: SAM1 (Segment Anything v1)
+────────────────────────────────────────────────────────────────────────────────
+
+  Architecture : ViT-Base image encoder + mask decoder (Meta AI)
+  Source       : github.com/facebookresearch/segment-anything
+
+  INPUT  → Single RGB frame (August Sentinel-2), padded to 1024×1024
+  OUTPUT → Instance masks (one binary mask per detected field)
+
+  ARCHITECTURE DETAILS
+  → Image encoder  : ViT-Base (frozen) — 86M params, not updated
+                     Variants: vit_b (default) | vit_l | vit_h
+  → Prompt encoder : Frozen — encodes point/box/mask prompts into embeddings
+  → Mask decoder   : 4M trainable params — two-layer transformer + upsampler
+                     Predicts 3 candidate masks per prompt; best is selected
+  → At inference   : SamAutomaticMaskGenerator sweeps a grid of point prompts
+                     across the tile and generates all field instances
+
+  TRAINING PARAMETERS
+  ┌──────────────────────────┬──────────────────────────────────────────┐
+  Epochs                   20                                      
+  Batch size               16                                      
+  Learning rate            1e-4                                    
+  Weight decay             1e-4                                    
+  Optimizer                AdamW                                   
+  LR scheduler             2-epoch linear warmup → CosineAnnealingLR│
+  Prompt type              Point prompts (centroid of each instance)│
+  Instances per sample     3 random field instances sampled/image  
+  Loss: segmentation       Focal loss (γ=2, α=0.5) + Dice loss    
+  Loss: IoU score head     L1 regression, weight = 0.05           
+  Mask head strategy       Best-of-3: loss computed on best mask   
+  Trainable params         ~4M (decoder only; encoder frozen)      
+  Max image size           1024×1024 (padded with zeros)           
+  └──────────────────────────┴──────────────────────────────────────────┘
+
+  WHY THESE CHOICES?
+  → Freeze encoder: ViT image features are already powerful; fine-tuning
+    only the decoder is far cheaper and avoids overfitting on a small dataset
+  → Focal loss: addresses extreme class imbalance (most pixels = background)
+    γ=2 down-weights easy negatives so the model focuses on hard boundaries
+  → Best-of-3 mask: SAM predicts 3 masks of different granularity per prompt;
+    selecting the one with lowest loss guides the model to field-level scale
+  → 2-epoch warmup: stabilizes early training before the LR ramps up
+
+
+────────────────────────────────────────────────────────────────────────────────
+SLIDE 9 — MODEL 3a: SAM2 — FROZEN / ZERO-SHOT (Segment Anything v2)
+────────────────────────────────────────────────────────────────────────────────
+
+  Architecture : Hiera backbone + memory-based decoder (Meta AI, 2024)
+  Source       : github.com/facebookresearch/segment-anything-2
+  Mode         : ZERO-SHOT — weights used as-is from Meta, no training
+
+  INPUT  → TWO frames: March (context window) + August (prediction window)
+           Both RGB, padded to 1024×1024
+  OUTPUT → Instance masks via SAM2AutomaticMaskGenerator
+
+  WHAT IS FROZEN
+  ┌──────────────────────────┬──────────────────────────────────────────┐
+  │ Component                │ Status                                   │
+  ├──────────────────────────┼──────────────────────────────────────────┤
+  │ Image encoder (Hiera)    │ FROZEN — pretrained by Meta on SA-1B     │
+  │ Memory encoder           │ FROZEN — encodes March as temporal memory │
+  │ Prompt encoder           │ FROZEN                                   │
+  │ Mask decoder             │ FROZEN — used as-is, no adaptation       │
+  └──────────────────────────┴──────────────────────────────────────────┘
+
+  INFERENCE PARAMETERS (frozen evaluation)
+  ┌──────────────────────────┬──────────────────────────────────────────┐
+  │ Variant used             │ base_plus (default)                      │
+  │ Prompt strategy          │ Automatic grid of point prompts          │
+  │ Temporal input           │ March → memory, August → prediction      │
+  │ Trainable params         │ 0 — fully frozen                         │
+  │ Script                   │ sam2/evaluate_frozen.py                  │
+  └──────────────────────────┴──────────────────────────────────────────┘
+
+  KEY POINTS
+  → Tests whether SAM2's general segmentation capability transfers to
+    satellite agricultural imagery out of the box
+  → March frame still used as memory context even in frozen mode
+  → Serves as a zero-shot baseline — compared directly against fine-tuned
+  → No GPU training cost; just inference
+  → Expected limitation: SAM2 was trained on natural images (SA-1B dataset),
+    not satellite or agricultural data — likely misses fine field boundaries
+
+
+────────────────────────────────────────────────────────────────────────────────
+SLIDE 9b — MODEL 3b: SAM2 — FINE-TUNED (Segment Anything v2)
+────────────────────────────────────────────────────────────────────────────────
+
+  Architecture : Hiera backbone + memory-based decoder (Meta AI, 2024)
+  Mode         : FINE-TUNED — mask decoder adapted on AI4Boundaries data
+
+  WHAT IS FROZEN vs TRAINED
+  ┌──────────────────────────┬──────────────────────────────────────────┐
+  │ Component                │ Status                                   │
+  ├──────────────────────────┼──────────────────────────────────────────┤
+  │ Image encoder (Hiera)    │ FROZEN — not updated                     │
+  │ Memory encoder           │ FROZEN — not updated                     │
+  │ Prompt encoder           │ FROZEN — not updated                     │
+  │ Mask decoder             │ TRAINED — ~4M params, fine-tuned only    │
+  └──────────────────────────┴──────────────────────────────────────────┘
+
+  HOW TEMPORAL MODELING WORKS
+  → Step 1: March frame encoded → stored in SAM2 memory bank (no gradients)
+  → Step 2: August frame encoded → decoder cross-attends to March memory
+  → Step 3: Decoder outputs field instance masks conditioned on both frames
+  → Seasonal contrast (bare soil in March vs mature crop in August) helps
+    the model sharpen ambiguous field boundaries
+
+  FINE-TUNING PARAMETERS
+  ┌──────────────────────────┬──────────────────────────────────────────┐
+  │ Epochs                   │ 20                                       │
+  │ Batch size               │ 4  (GPU memory limit: 2 × 1024² frames)  │
+  │ Gradient accumulation    │ × 4  →  effective batch size = 16        │
+  │ Learning rate            │ 5e-5  (lower than SAM1 — larger model)   │
+  │ Weight decay             │ 1e-4                                     │
+  │ Optimizer                │ AdamW                                    │
+  │ LR scheduler             │ 2-epoch linear warmup → CosineAnnealingLR│
+  │ Prompt mix (per batch)   │ 33% point only                           │
+  │                          │ 33% mask only (GT from March frame)      │
+  │                          │ 33% point + mask combined                │
+  │ Loss: segmentation       │ Focal (γ=2, α=0.5) + Dice               │
+  │ Loss: IoU score head     │ L1 regression, weight = 0.05            │
+  │ Mask head strategy       │ Best-of-3 (picks lowest-loss candidate)  │
+  │ Trainable params         │ ~4M (decoder only)                       │
+  │ Max image size           │ 1024×1024                                │
+  │ Script                   │ sam2/train.py + sam2/evaluate.py         │
+  └──────────────────────────┴──────────────────────────────────────────┘
+
+  WHY THESE CHOICES?
+  → LR 5e-5 (vs 1e-4 for SAM1): Hiera is a larger backbone; small decoder
+    updates prevent gradient instability from propagating back
+  → Gradient accumulation × 4: two 1024×1024 frames double memory usage;
+    accumulation recovers effective batch=16 without increasing GPU RAM
+  → Prompt mixing: training with all three prompt types forces robustness —
+    at inference any prompt type can be used reliably
+  → Focal loss γ=2: agricultural tiles are ~80% background; focal loss
+    down-weights easy background pixels and focuses on hard boundary regions
+  → Best-of-3 masks: SAM2 outputs 3 granularity levels per prompt;
+    selecting the best one guides the model to field-level scale
+
+
+────────────────────────────────────────────────────────────────────────────────
+SLIDE 10 — MODEL 4: DelineateAnything
+────────────────────────────────────────────────────────────────────────────────
+
+  Architecture : YOLO11x-seg (Ultralytics)
+  Source       : huggingface.co/MykolaL/DelineateAnything
+
+  INPUT  → Single RGB frame (August Sentinel-2), 256×256
+  OUTPUT → Instance field polygons + binary masks (YOLO Results object)
+
+  ARCHITECTURE DETAILS
+  → Backbone    : CSPDarknet (Cross-Stage Partial) — 203 layers
+  → Neck        : PANet (Path Aggregation Network) — multi-scale feature fusion
+  → Head        : Dual head: bounding box regression + instance mask branch
+  → Mask branch : 32 prototype masks, combined via predicted coefficients
+  → Variants    : DelineateAnything-S (YOLO11n, smaller/faster)
+                  DelineateAnything   (YOLO11x, larger/default)
+
+  MODEL STATISTICS
+  ┌──────────────────────────┬──────────────────────────────────────────┐
+  Total parameters         62,003,283  (~62M)                      
+  Layers (fused)           203                                     
+  Compute (GFLOPs)         295.9                                   
+  Pre-training dataset     FBIS-22M (22M field boundary instances) 
+  Trainable params (here)  None — zero-shot, no fine-tuning        
+  └──────────────────────────┴──────────────────────────────────────────┘
+
+  INFERENCE PARAMETERS (used in evaluation)
+  ┌──────────────────────────┬──────────────────────────────────────────┐
+  Confidence threshold     0.05  (very low — catch small fields)   
+  IoU threshold (NMS)      0.3   (Non-Max Suppression overlap limit)│
+  Max detections per tile  300                                     
+  Input resize factor      2× internally before inference          
+  └──────────────────────────┴──────────────────────────────────────────┘
+
+  WHY THESE CHOICES?
+  → Conf = 0.05: field boundaries are often low contrast; high threshold
+    would miss many small or irregular parcels
+  → IoU NMS = 0.3: adjacent fields share edges — a tighter threshold
+    would suppress valid neighboring field detections
+  → Max 300: rural tiles can have many small fields; cap prevents memory overrun
+
+
+────────────────────────────────────────────────────────────────────────────────
+SLIDE 11 — MODEL 5: FTW Pretrained Baselines
+────────────────────────────────────────────────────────────────────────────────
+
+  Architecture : UNet + EfficientNet (B3 / B5 / B7), UPerNet, DeepLabV3+
+  Source       : github.com/fieldsoftheworld/ftw-baselines
+
+  INPUT  → Sentinel-2 (single window or dual window, varies by variant)
+  OUTPUT → 2-class or 3-class semantic segmentation map
+
+  MODEL VARIANTS AVAILABLE
+  ┌────────────────────────────────┬─────────┬─────────┬──────────────┐
+  Model Name                     Classes Windows Backbone    
+  ├────────────────────────────────┼─────────┼─────────┼──────────────┤
+  FTW_v1_2_Class_FULL            2       single  UNet        
+  FTW_v1_3_Class_FULL            3       single  UNet        
+  FTW_v2_3_Class_FULL_multiWindow│ 3       dual    UNet        
+  FTW_PRUE_EFNET_B3              3       dual    EffNet-B3   
+  FTW_PRUE_EFNET_B5  (default)   3       dual    EffNet-B5   
+  FTW_PRUE_EFNET_B7              3       dual    EffNet-B7   
+  └────────────────────────────────┴─────────┴─────────┴──────────────┘
+  (CC-BY variants of each also available for license-restricted use)
+
+  KEY PARAMETERS
+  ┌──────────────────────────┬──────────────────────────────────────────┐
+  Trainable params (B5)    ~30M                                    
+  Output classes           2 (background/field) or 3 (+boundary)   
+  Input channels           4 (single window) or 8 (dual window)    
+  Fine-tuning here         None — evaluated zero-shot              
+  Training corpus          Fields of the World (global, multi-region)│
+  └──────────────────────────┴──────────────────────────────────────────┘
+
+  WHY INCLUDE THIS?
+  → Strong zero-shot baseline: FTW trained on global field data
+  → Tests whether a globally pre-trained model transfers to Brittany/France
+    without any local adaptation
+
+
+────────────────────────────────────────────────────────────────────────────────
+SLIDE 12 — TRAINING HYPERPARAMETERS COMPARISON
+────────────────────────────────────────────────────────────────────────────────
+
+  Side-by-side of all tunable parameters across the three trained models:
+
+  ┌──────────────────────┬──────────────┬──────────────┬──────────────┐
+  Parameter            UNet         SAM1         SAM2        
+  ├──────────────────────┼──────────────┼──────────────┼──────────────┤
+  Epochs               100          20           20          
+  Batch size           8            16           4 (acc ×4)  
+  Effective batch      8            16           16          
+  Learning rate        1e-4         1e-4         5e-5        
+  Weight decay         1e-4         1e-4         1e-4        
+  Optimizer            AdamW        AdamW        AdamW       
+  LR schedule          CosineAnneal Warmup+Cos   Warmup+Cos  
+  Warmup epochs        None         2            2           
+  Loss — seg           CE + Dice    Focal + Dice Focal + Dice
+  Loss — extra head    None         IoU L1 (5%)  IoU L1 (5%)
+  Mask candidates      1            Best of 3    Best of 3   
+  Trainable params     ~30M         ~4M          ~4M         
+  Frozen components    None         Encoder+Prompt│ Enc+Prompt+
+                                                  Memory     
+  Input size           256×256      1024×1024    1024×1024   
+  Input channels       8 (bi-temp)  3 (RGB)      3+3 (2 frames│
+  AMP                  CUDA only    CUDA/MPS     CUDA/MPS    
+  └──────────────────────┴──────────────┴──────────────┴──────────────┘
+
+  KEY DESIGN DECISIONS
+
+  Learning rate:
+  → SAM2 uses a lower LR (5e-5) than SAM1 (1e-4) because the Hiera
+    backbone is larger and more sensitive; small decoder updates are safer
+
+  Batch size vs gradient accumulation:
+  → SAM2 processes two 1024×1024 frames simultaneously — GPU memory limits
+    batch to 4; gradient accumulation × 4 recovers the effective batch of 16
+
+  Loss weighting (UNet boundary class = 5×):
+  → Boundary pixels are ~5% of the mask; without upweighting the model
+    learns to predict all-field and still achieves high accuracy
+
+  Focal loss γ=2 (SAM1 / SAM2):
+  → Down-weights easy background pixels exponentially; forces the model
+    to focus gradient updates on hard-to-classify boundary regions
+
+  Warmup (SAM1 / SAM2):
+  → Starting with a very low LR for 2 epochs prevents the frozen encoder
+    embeddings from being disrupted by large early decoder gradients
+
+
+────────────────────────────────────────────────────────────────────────────────
+SLIDE 14 — EVALUATION METRICS
+────────────────────────────────────────────────────────────────────────────────
+
+  TWO COMPLEMENTARY METRICS:
+
+  1. Field IoU (Pixel-level)
+     → Intersection over Union for the "field" class at pixel level
+     → Measures how accurately total field area is recovered
+
+  2. Object-level Precision / Recall / F1
+     → Each predicted field instance is matched to a GT instance
+     → True Positive: overlap IoU ≥ 0.5
+     → Precision = TP / (TP + FP)   — how many predictions are correct
+     → Recall    = TP / (TP + FN)   — how many real fields were found
+     → F1        = harmonic mean of Precision and Recall
+
+  WHY BOTH?
+  → IoU captures area quality; object metrics capture whether individual
+    fields are detected as separate instances
+
+
+────────────────────────────────────────────────────────────────────────────────
+SLIDE 15 — VISUAL OUTPUTS
+────────────────────────────────────────────────────────────────────────────────
+
+  For each model, evaluation generates:
+
+  → RGB image (contrast-stretched Sentinel-2)
+  → Ground Truth overlay (green = labeled field area)
+  → Prediction overlay (orange = model-predicted field area)
+  → Error map:
+       Green = True Positive  (correct field pixel)
+       Red   = False Positive (predicted field, not GT)
+       Blue  = False Negative (missed field pixel)
+       Black = True Negative  (correct background)
+
+  Per-run summary plots:
+  → Bar chart, histogram, box plots, precision-recall scatter
+
+
+────────────────────────────────────────────────────────────────────────────────
+SLIDE 16 — KEY ARCHITECTURAL DIFFERENCES
+────────────────────────────────────────────────────────────────────────────────
+
+                   UNet    SAM1    SAM2    DelineateAny  FTW
+  ─────────────────────────────────────────────────────────────
+  Temporal input    Yes     No      Yes       No          Some
+  Trainable params  ~30M    ~4M     ~4M       None        None
+  Output type       Semantic Instance Instance Instance  Semantic
+  Backbone frozen   No      Yes     Yes       Yes         Yes
+  Zero-shot         No      No      No        YES         YES
+  Speed             Med     Fast    Med       Very fast   Fast
+  ─────────────────────────────────────────────────────────────
+
+
+────────────────────────────────────────────────────────────────────────────────
+SLIDE 17 — TECH STACK
+────────────────────────────────────────────────────────────────────────────────
+
+  Deep Learning   : PyTorch 2.2+, segmentation-models-pytorch, SAM2, Ultralytics
+  Geospatial I/O  : Rasterio (GeoTIFF), xarray (NetCDF), GeoPandas
+  Training Utils  : AdamW, CosineAnnealingLR, AMP (mixed precision)
+  Hardware support: CUDA (GPU), MPS (Apple Silicon), CPU fallback
+  Environment     : Python 3.11, Conda (environment.yml)
+
+
+────────────────────────────────────────────────────────────────────────────────
+SLIDE 18 — SUMMARY / TAKEAWAYS
+────────────────────────────────────────────────────────────────────────────────
+
+  → Field boundary delineation is a non-trivial remote sensing challenge
+    requiring both pixel-level accuracy and instance-level detection
+
+  → Five distinct approaches benchmarked on the same dataset:
+    from full training to zero-shot deployment
+
+  → Temporal information (March + August) improves detection for
+    models that can exploit it (UNet, SAM2)
+
+  → Zero-shot models (DelineateAnything, FTW) provide strong baselines
+    without any dataset-specific training
+
+  → Evaluation uses both pixel IoU and object-level P/R/F1 to capture
+    area quality and instance detection quality separately
+
+
+================================================================================
